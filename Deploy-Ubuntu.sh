@@ -798,8 +798,14 @@ _randomize_vercel_json() {
   [[ -f "$vcfg" ]] || return
   ORIG_VCFG=$(cat "$vcfg")
   local rname="edge-$(_random_str 10)"
-  jq --arg n "$rname" '.name=$n' "$vcfg" > "${vcfg}.tmp" && mv "${vcfg}.tmp" "$vcfg"
-  info "Randomized vercel.json name: $rname"
+  if [[ -n "${VERCEL_JSON_VERSION_OVERRIDE:-}" ]]; then
+    jq --arg n "$rname" --argjson v "$VERCEL_JSON_VERSION_OVERRIDE" \
+      '.name=$n | .version=$v' "$vcfg" > "${vcfg}.tmp" && mv "${vcfg}.tmp" "$vcfg"
+    info "Randomized vercel.json name: $rname, version=$VERCEL_JSON_VERSION_OVERRIDE"
+  else
+    jq --arg n "$rname" '.name=$n' "$vcfg" > "${vcfg}.tmp" && mv "${vcfg}.tmp" "$vcfg"
+    info "Randomized vercel.json name: $rname"
+  fi
 }
 
 _restore_vercel_json() {
@@ -851,6 +857,13 @@ _vercel_diagnose_deploy_error() {
     _restore_vercel_json 2>/dev/null || true
     _restore_package_json 2>/dev/null || true
     return 1
+  fi
+
+  # ── Vercel config schema ────────────────────────────────
+  if echo "$out" | grep -qiE "version.*property.*vercel\.json.*only be.*2|vercel\.json.*version.*only be.*2"; then
+    warn "Vercel requires vercel.json version=2 for this deploy — retrying with a temporary override"
+    VERCEL_JSON_VERSION_OVERRIDE=2
+    return 0
   fi
 
   # ── Network / DNS from server ───────────────────────────
