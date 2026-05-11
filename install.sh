@@ -40,7 +40,9 @@ fi
 # ── clone or update repo ─────────────────────────────────
 if [[ -d "$TARGET_DIR/.git" ]]; then
   warn "Existing install found at $TARGET_DIR — updating..."
+  git -C "$TARGET_DIR" remote set-url origin "$REPO_URL"
   git -C "$TARGET_DIR" fetch --depth=1 origin "$BRANCH"
+  git -C "$TARGET_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
   git -C "$TARGET_DIR" reset --hard "origin/$BRANCH"
   ok "Repo updated"
 else
