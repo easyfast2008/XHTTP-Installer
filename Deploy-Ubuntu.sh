@@ -116,15 +116,39 @@ autofix_diagnose() {
         pid80=$(ss -tlnp 2>/dev/null | grep ':80 ' | grep -oP 'pid=\K[0-9]+' | head -1)
         [[ -n "$pid80" ]] && { warn "Killing port-80 process PID $pid80"; kill "$pid80" 2>/dev/null || true; sleep 2; }
       fi
-      local resolved_ip my_ip
-      resolved_ip=$(dig +short "${CFG_DOMAIN:-x}" A 2>/dev/null | tail -1 || true)
-      my_ip=$(curl -s --max-time 4 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+      local resolved_ip my_ipv4 my_ipv6
+      resolved_ip=$(dig +short "${CFG_DOMAIN:-x}" A 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -1 || true)
+
+      # Get public IPv4 — try multiple sources including AWS/GCP/Azure metadata APIs
+      # AWS Lightsail/EC2: public IP is NOT on any interface (NAT), must use metadata
+      my_ipv4=$(
+        # AWS EC2/Lightsail metadata (IMDSv1 — works without token on most instances)
+        curl -4 -s --max-time 3 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null | \
+          grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1
+      )
+      if [[ -z "$my_ipv4" ]]; then
+        my_ipv4=$(
+          curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null ||
+          curl -4 -s --max-time 5 https://api4.ipify.org 2>/dev/null ||
+          curl -4 -s --max-time 5 https://ipv4.icanhazip.com 2>/dev/null ||
+          hostname -I 2>/dev/null | tr ' ' '\n' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true
+        )
+      fi
+      my_ipv6=$(curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null || \
+                hostname -I 2>/dev/null | tr ' ' '\n' | grep ':' | head -1 || true)
+
       if [[ -z "$resolved_ip" ]]; then
-        fail "DNS: ${CFG_DOMAIN:-?} does not resolve. Point A-record to ${my_ip}"
-      elif [[ "$resolved_ip" != "$my_ip" ]]; then
-        fail "DNS mismatch: ${CFG_DOMAIN:-?} -> ${resolved_ip} (server: ${my_ip})"
+        fail "DNS: ${CFG_DOMAIN:-?} A-record not found. Point it to ${my_ipv4:-<your-server-ip>}"
+        [[ -n "$my_ipv6" ]] && info "Server also has IPv6: ${my_ipv6} (use AAAA record if needed)"
+      elif [[ "$resolved_ip" == "$my_ipv4" ]]; then
+        ok "DNS OK: ${CFG_DOMAIN:-?} -> ${resolved_ip} (matches server public IPv4)"
+      elif [[ -n "$my_ipv6" ]] && dig +short "${CFG_DOMAIN:-x}" AAAA 2>/dev/null | grep -q "$my_ipv6"; then
+        ok "DNS OK: ${CFG_DOMAIN:-?} AAAA record matches server IPv6"
       else
-        ok "DNS OK: ${CFG_DOMAIN:-?} -> ${resolved_ip}"
+        fail "DNS mismatch: ${CFG_DOMAIN:-?} -> ${resolved_ip}  |  server public IPv4: ${my_ipv4:-?}"
+        [[ -n "$my_ipv6" ]] && info "Server IPv6: ${my_ipv6}"
+        warn "Fix: set A-record of ${CFG_DOMAIN:-?} to ${my_ipv4:-<server-public-ip>}"
+        info "Note: on AWS Lightsail/EC2, use the Static/Elastic IP shown in the console, not the private IP"
       fi
       ufw allow 80/tcp 2>/dev/null || true
       ok "Firewall: port 80 opened"
@@ -261,24 +285,102 @@ phase2_install_all() {
   chmod 644 /var/log/xray/*.log 2>/dev/null || true
 
   # ── 2b. Netlify CLI ─────────────────────────────────────
-  if command -v netlify &>/dev/null; then
+  if command -v netlify &>/dev/null && netlify --version &>/dev/null 2>&1; then
     ok "Netlify CLI already installed ($(netlify --version 2>/dev/null | head -1))"
   else
     info "Installing Netlify CLI..."
-    npm install -g netlify-cli --silent
-    ok "Netlify CLI installed"
+
+    # Check Node version — netlify-cli needs Node 18+
+    local node_ver
+    node_ver=$(node -e "process.exit(process.versions.node.split('.')[0])" 2>/dev/null; node -e "console.log(process.versions.node.split('.')[0])" 2>/dev/null || echo "0")
+    if [[ "${node_ver:-0}" -lt 18 ]]; then
+      warn "Node.js ${node_ver} detected — netlify-cli needs 18+. Upgrading Node.js..."
+      curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - >/dev/null 2>&1
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs 2>/dev/null
+      ok "Node.js upgraded to $(node -v)"
+    fi
+
+    local netlify_ok=false
+
+    # ── Attempt 1: standard npm global install ───────────
+    info "Attempt 1/4: npm install -g netlify-cli..."
+    if npm install -g netlify-cli --prefer-online 2>&1 | tail -3; then
+      command -v netlify &>/dev/null && netlify_ok=true
+    fi
+
+    # ── Attempt 2: npm with lower max-old-space (low-RAM VPS) ─
+    if [[ "$netlify_ok" != "true" ]]; then
+      warn "Attempt 1 failed — trying with reduced memory limit (512 MB)..."
+      if NODE_OPTIONS="--max-old-space-size=512" npm install -g netlify-cli 2>&1 | tail -3; then
+        command -v netlify &>/dev/null && netlify_ok=true
+      fi
+    fi
+
+    # ── Attempt 3: npm cache clean + retry ───────────────
+    if [[ "$netlify_ok" != "true" ]]; then
+      warn "Attempt 2 failed — cleaning npm cache and retrying..."
+      npm cache clean --force 2>/dev/null || true
+      if npm install -g netlify-cli 2>&1 | tail -3; then
+        command -v netlify &>/dev/null && netlify_ok=true
+      fi
+    fi
+
+    # ── Attempt 4: npx wrapper (no global install needed) ─
+    if [[ "$netlify_ok" != "true" ]]; then
+      warn "Attempt 3 failed — creating npx-based wrapper instead..."
+      cat > /usr/local/bin/netlify <<'NPXWRAP'
+#!/usr/bin/env bash
+exec npx --yes netlify-cli "$@"
+NPXWRAP
+      chmod +x /usr/local/bin/netlify
+      # Warm up the npx cache once
+      npx --yes netlify-cli --version >/dev/null 2>&1 && netlify_ok=true || true
+    fi
+
+    if [[ "$netlify_ok" == "true" ]]; then
+      ok "Netlify CLI ready: $(netlify --version 2>/dev/null | head -1)"
+    else
+      fail "Could not install Netlify CLI after 4 attempts."
+      warn "Manual fix: npm install -g netlify-cli  or  npx netlify-cli"
+      warn "Installation will continue but Netlify deploy phase may fail."
+    fi
   fi
 
   # ── 2c. acme.sh ─────────────────────────────────────────
   if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
     ok "acme.sh already installed"
   else
-    info "Installing acme.sh..."
-    curl -fsSL https://get.acme.sh | sh -s -- --install-online 2>&1 | \
-      grep -E "(install|OK|error|Error)" || true
-    ok "acme.sh installed"
+    info "Installing acme.sh (attempt 1/2 — official)..."
+    curl -fsSL https://get.acme.sh | sh -s email=admin@example.com 2>&1 | \
+      grep -E "(install|Installed|OK|error|Error|success)" || true
+
+    if [[ ! -f "$HOME/.acme.sh/acme.sh" ]]; then
+      warn "First attempt failed — trying alternative mirror..."
+      curl -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh \
+        -o /tmp/acme-install.sh 2>/dev/null && \
+        bash /tmp/acme-install.sh --install-online 2>&1 | \
+          grep -E "(install|Installed|OK|error|Error)" || true
+      rm -f /tmp/acme-install.sh
+    fi
+
+    if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
+      ok "acme.sh installed → $HOME/.acme.sh/acme.sh"
+    else
+      fail "acme.sh installation failed — SSL certificate phase will not work."
+      warn "Manual fix on server: curl https://get.acme.sh | sh"
+      warn "Continuing... (script will fail at SSL phase)"
+    fi
   fi
+
+  # Source acme.sh env so it's on PATH for this session
+  [[ -f "$HOME/.acme.sh/acme.sh.env" ]] && source "$HOME/.acme.sh/acme.sh.env" 2>/dev/null || true
   ACME_CMD="$HOME/.acme.sh/acme.sh"
+
+  # Hard-fail early if acme.sh truly missing — better than cryptic "No such file" later
+  if [[ ! -x "$ACME_CMD" ]]; then
+    fail "acme.sh not found at $ACME_CMD — cannot continue without SSL tool."
+    exit 1
+  fi
 
   # ── 2d. Vercel CLI ──────────────────────────────────────
   if command -v vercel &>/dev/null; then
@@ -1198,13 +1300,25 @@ phase5_healthcheck() {
   echo -e "\n  ${C_CYAN}[ Test 3 ] End-to-end VLESS+XHTTP test (real client)${C_RESET}"
   if [[ -z "${VERCEL_HOST:-}" || -z "${INBOUND_UUID:-}" ]]; then
     warn "Missing relay host or UUID — skipping E2E test"
+    info "  VERCEL_HOST='${VERCEL_HOST:-<empty>}'  INBOUND_UUID='${INBOUND_UUID:-<empty>}'"
   else
+    # Locate the xray binary (must be explicit — PATH can be stripped in screen/sudo)
+    local XRAY_BIN
+    XRAY_BIN=$(command -v xray 2>/dev/null || echo "")
+    [[ -z "$XRAY_BIN" ]] && XRAY_BIN="/usr/local/bin/xray"
+    if [[ ! -x "$XRAY_BIN" ]]; then
+      warn "xray binary not found at '$XRAY_BIN' — skipping E2E test"
+      E2E_STATUS="UNKNOWN"
+      E2E_DETAIL="xray binary not found"
+    else
+    info "E2E vars — relay: ${VERCEL_HOST}  uuid: ${INBOUND_UUID}  path: ${CFG_PUBLIC_PATH}"
+
     local TEST_SOCKS_PORT=10809
     local TEST_CFG
     TEST_CFG=$(mktemp --suffix=.json)
     cat > "$TEST_CFG" <<E2ECFG
 {
-  "log": {"loglevel": "warning"},
+  "log": {"loglevel": "debug"},
   "inbounds": [{
     "tag": "socks-test",
     "port": ${TEST_SOCKS_PORT},
@@ -1213,6 +1327,7 @@ phase5_healthcheck() {
     "settings": {"auth": "noauth", "udp": false}
   }],
   "outbounds": [{
+    "tag": "vless-out",
     "protocol": "vless",
     "settings": {
       "vnext": [{
@@ -1226,7 +1341,8 @@ phase5_healthcheck() {
       "security": "tls",
       "tlsSettings": {
         "serverName": "${VERCEL_HOST}",
-        "alpn": ["h2", "http/1.1"]
+        "alpn": ["h2", "http/1.1"],
+        "allowInsecure": false
       },
       "xhttpSettings": {
         "path": "${CFG_PUBLIC_PATH}",
@@ -1244,25 +1360,42 @@ E2ECFG
     # Free the test port if anything is on it
     local _pid
     _pid=$(lsof -ti:${TEST_SOCKS_PORT} 2>/dev/null || true)
-    [[ -n "$_pid" ]] && kill "$_pid" 2>/dev/null && sleep 1
-
-    info "Starting xray test client on 127.0.0.1:${TEST_SOCKS_PORT}..."
-    xray run -c "$TEST_CFG" >/tmp/xray-test-client.log 2>&1 &
-    local TEST_PID=$!
-    trap "kill ${TEST_PID} 2>/dev/null; rm -f '$TEST_CFG' /tmp/xray-test-client.log 2>/dev/null" RETURN
-    sleep 4
+    [[ -n "$_pid" ]] && { info "Killing existing PID ${_pid} on port ${TEST_SOCKS_PORT}"; kill -9 "$_pid" 2>/dev/null || true; sleep 1; }
 
     # Initialize global E2E status for final summary
     E2E_STATUS="UNKNOWN"
     E2E_DETAIL=""
 
-    if ! kill -0 "$TEST_PID" 2>/dev/null; then
-      fail "xray test client died during startup"
-      tail -8 /tmp/xray-test-client.log | while read -r l; do echo -e "  ${C_GRAY}  $l${C_RESET}"; done
+    info "Starting xray test client (${XRAY_BIN}) on 127.0.0.1:${TEST_SOCKS_PORT}..."
+    "$XRAY_BIN" run -c "$TEST_CFG" >/tmp/xray-test-client.log 2>&1 &
+    local TEST_PID=$!
+    trap "kill ${TEST_PID} 2>/dev/null; sleep 1; kill -9 ${TEST_PID} 2>/dev/null; rm -f '${TEST_CFG}' /tmp/xray-test-client.log 2>/dev/null" RETURN
+
+    # ── Wait up to 12 s for the SOCKS port to actually open ──
+    local port_ready=false pw=0
+    while [[ $pw -lt 12 ]]; do
+      sleep 1; pw=$(( pw + 1 ))
+      # Check if process died early
+      if ! kill -0 "$TEST_PID" 2>/dev/null; then
+        fail "xray test client exited after ${pw}s"
+        break
+      fi
+      # Use ss (preferred) or nc to confirm port is listening
+      if ss -tlnp 2>/dev/null | grep -q ":${TEST_SOCKS_PORT} " || \
+         nc -z 127.0.0.1 "${TEST_SOCKS_PORT}" 2>/dev/null; then
+        port_ready=true
+        break
+      fi
+    done
+
+    if [[ "$port_ready" != "true" ]]; then
+      fail "xray test client SOCKS port ${TEST_SOCKS_PORT} never opened (waited ${pw}s)"
+      info "Last 15 lines of xray test client log:"
+      tail -15 /tmp/xray-test-client.log 2>/dev/null | while read -r l; do echo -e "  ${C_GRAY}  $l${C_RESET}"; done
       E2E_STATUS="FAIL"
-      E2E_DETAIL="test client did not start"
+      E2E_DETAIL="SOCKS port ${TEST_SOCKS_PORT} did not open (check xray test client log)"
     else
-      ok "Test client running (PID $TEST_PID)"
+      ok "Test client running (PID $TEST_PID) — SOCKS port ${TEST_SOCKS_PORT} open after ${pw}s"
 
       # Try up to 3 times with backoff (Netlify CDN propagation can take ~30s)
       local attempt=0 probe_code="000" probe_time="0"
@@ -1273,14 +1406,14 @@ E2ECFG
         probe_out=$(curl --socks5-hostname 127.0.0.1:${TEST_SOCKS_PORT} \
           -s -o /dev/null \
           -w "code=%{http_code}|time=%{time_total}" \
-          --max-time 20 \
+          --max-time 25 \
           "https://www.gstatic.com/generate_204" 2>&1 || true)
         probe_code=$(echo "$probe_out" | grep -oP 'code=\K[0-9]+' || echo "000")
         probe_time=$(echo "$probe_out" | grep -oP 'time=\K[0-9.]+' || echo "0")
         if [[ "$probe_code" == "204" || "$probe_code" == "200" ]]; then
           break
         fi
-        [[ $attempt -lt 3 ]] && { warn "Got HTTP ${probe_code} — waiting 5s for CDN propagation..."; sleep 5; }
+        [[ $attempt -lt 3 ]] && { warn "Got HTTP ${probe_code} — waiting 8s for CDN propagation..."; sleep 8; }
       done
 
       if [[ "$probe_code" == "204" || "$probe_code" == "200" ]]; then
@@ -1381,6 +1514,7 @@ E2ECFG
     kill -9 "$TEST_PID" 2>/dev/null || true
     rm -f "$TEST_CFG" /tmp/xray-test-client.log
     trap - RETURN
+    fi  # end: xray binary found
   fi
   # End of phase5 (Test 4 / xray-knife removed — Test 3 above is the authoritative check)
   return 0
