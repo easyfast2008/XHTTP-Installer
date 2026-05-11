@@ -24,6 +24,9 @@ LOG_FILE="/tmp/xhttp-install.log"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERCEL_DIR="${SCRIPT_DIR}/deploy/vercel"
 NETLIFY_DIR="${SCRIPT_DIR}/deploy/netlify"
+STATE_DIR="/etc/xhttp-installer"
+STATE_FILE="${STATE_DIR}/state.json"
+LINKS_FILE="${STATE_DIR}/client-links.txt"
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -319,6 +322,185 @@ _ensure_acme_ready() {
   return 0
 }
 
+_load_existing_server_config() {
+  EXISTING_CONFIG_FOUND=false
+  local state_domain="" state_port="" state_path="" state_uuid="" state_cert="" state_key=""
+
+  if [[ -s "$STATE_FILE" ]] && command -v jq &>/dev/null; then
+    state_domain=$(jq -r '.server.domain // empty' "$STATE_FILE" 2>/dev/null || true)
+    state_port=$(jq -r '.server.inbound_port // empty' "$STATE_FILE" 2>/dev/null || true)
+    state_path=$(jq -r '.server.relay_path // empty' "$STATE_FILE" 2>/dev/null || true)
+    state_uuid=$(jq -r '.server.uuid // empty' "$STATE_FILE" 2>/dev/null || true)
+    state_cert=$(jq -r '.server.ssl_cert // empty' "$STATE_FILE" 2>/dev/null || true)
+    state_key=$(jq -r '.server.ssl_key // empty' "$STATE_FILE" 2>/dev/null || true)
+  fi
+
+  if [[ -z "$state_domain" || -z "$state_port" || -z "$state_path" || -z "$state_uuid" ]]; then
+    local xray_cfg="/usr/local/etc/xray/config.json"
+    if [[ -s "$xray_cfg" ]] && command -v jq &>/dev/null; then
+      state_domain=$(jq -r '.inbounds[]? | select(.protocol=="vless") | .streamSettings.xhttpSettings.host // empty' "$xray_cfg" 2>/dev/null | head -1)
+      state_port=$(jq -r '.inbounds[]? | select(.protocol=="vless") | .port // empty' "$xray_cfg" 2>/dev/null | head -1)
+      state_path=$(jq -r '.inbounds[]? | select(.protocol=="vless") | .streamSettings.xhttpSettings.path // empty' "$xray_cfg" 2>/dev/null | head -1)
+      state_uuid=$(jq -r '.inbounds[]? | select(.protocol=="vless") | .settings.clients[0].id // empty' "$xray_cfg" 2>/dev/null | head -1)
+      state_cert=$(jq -r '.inbounds[]? | select(.protocol=="vless") | .streamSettings.tlsSettings.certificates[0].certificateFile // empty' "$xray_cfg" 2>/dev/null | head -1)
+      state_key=$(jq -r '.inbounds[]? | select(.protocol=="vless") | .streamSettings.tlsSettings.certificates[0].keyFile // empty' "$xray_cfg" 2>/dev/null | head -1)
+    fi
+  fi
+
+  if [[ -n "$state_domain" && -n "$state_port" && -n "$state_path" && -n "$state_uuid" ]]; then
+    EXISTING_CONFIG_FOUND=true
+    EXISTING_DOMAIN="$state_domain"
+    EXISTING_INBOUND_PORT="$state_port"
+    EXISTING_RELAY_PATH="$state_path"
+    EXISTING_UUID="$state_uuid"
+    EXISTING_SSL_CERT="${state_cert:-/etc/ssl/xhttp/${state_domain}/fullchain.pem}"
+    EXISTING_SSL_KEY="${state_key:-/etc/ssl/xhttp/${state_domain}/privkey.pem}"
+    return 0
+  fi
+
+  return 1
+}
+
+_print_saved_relays() {
+  [[ -s "$STATE_FILE" ]] && command -v jq &>/dev/null || return 0
+  local count
+  count=$(jq -r '(.relays // []) | length' "$STATE_FILE" 2>/dev/null || echo 0)
+  [[ "${count:-0}" -gt 0 ]] || return 0
+
+  echo -e "\n  ${C_CYAN}[ Existing relay deployments ]${C_RESET}"
+  jq -r '(.relays // []) | to_entries[] |
+    "  \(.key + 1)) \(.value.platform)  \(.value.url)  public_path=\(.value.public_path)  status=\(.value.e2e_status // "unknown")"' \
+    "$STATE_FILE" 2>/dev/null || true
+}
+
+phase_existing_install_mode() {
+  ADD_RELAY_ONLY=false
+  _load_existing_server_config || return 0
+
+  echo -e "\n  ${C_CYAN}[ Existing XHTTP server config detected ]${C_RESET}"
+  echo -e "  ${C_WHITE}Domain       :${C_RESET} ${EXISTING_DOMAIN}"
+  echo -e "  ${C_WHITE}Inbound port :${C_RESET} ${EXISTING_INBOUND_PORT}"
+  echo -e "  ${C_WHITE}RELAY_PATH   :${C_RESET} ${EXISTING_RELAY_PATH}"
+  echo -e "  ${C_WHITE}UUID         :${C_RESET} ${EXISTING_UUID}"
+  _print_saved_relays
+
+  echo ""
+  echo -e "  ${C_WHITE}Choose how to continue:${C_RESET}"
+  echo -e "    ${C_YELLOW}1${C_RESET}) Add another Vercel/Netlify relay using this existing server config"
+  echo -e "    ${C_YELLOW}2${C_RESET}) Full reinstall/reconfigure server and deploy a relay"
+  echo -e "    ${C_YELLOW}3${C_RESET}) Exit"
+  local mode_choice
+  while true; do
+    read -rp "$(echo -e "  ${C_WHITE}Enter choice [1/2/3]${C_RESET}: ")" mode_choice
+    case "$mode_choice" in
+      1)
+        ADD_RELAY_ONLY=true
+        CFG_DOMAIN="$EXISTING_DOMAIN"
+        CFG_INBOUND_PORT="$EXISTING_INBOUND_PORT"
+        CFG_RELAY_PATH="$EXISTING_RELAY_PATH"
+        INBOUND_UUID="$EXISTING_UUID"
+        SSL_CERT="$EXISTING_SSL_CERT"
+        SSL_KEY="$EXISTING_SSL_KEY"
+        ok "Using existing server config; only a new relay deployment will be added"
+        break ;;
+      2)
+        ADD_RELAY_ONLY=false
+        warn "Full reinstall selected; a new UUID may invalidate old client configs"
+        break ;;
+      3)
+        warn "Aborted by user."
+        exit 0 ;;
+      *) fail "Enter 1, 2, or 3" ;;
+    esac
+  done
+}
+
+phase_select_platform() {
+  echo -e "\n  ${C_CYAN}[ Deployment Platform ]${C_RESET}"
+  echo -e "  ${C_WHITE}Choose relay platform:${C_RESET}"
+  echo -e "    ${C_YELLOW}1${C_RESET}) Vercel"
+  echo -e "    ${C_YELLOW}2${C_RESET}) Netlify"
+  local plat_choice
+  while true; do
+    read -rp "$(echo -e "  ${C_WHITE}Enter choice [1/2]${C_RESET}: ")" plat_choice
+    case "$plat_choice" in
+      1) CFG_PLATFORM="vercel";  break ;;
+      2) CFG_PLATFORM="netlify"; break ;;
+      *) fail "Enter 1 for Vercel or 2 for Netlify" ;;
+    esac
+  done
+  ok "Platform: ${CFG_PLATFORM}"
+}
+
+_persist_current_relay() {
+  local client_link="${1:-}"
+  local relay_url="${VERCEL_URL:-}"
+  [[ -n "$relay_url" && "$relay_url" != "(check dashboard)" ]] || return 0
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+  local now tmp_state project site scope
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  tmp_state=$(mktemp)
+  project="${CFG_PROJECT_NAME:-}"
+  site="${CFG_NETLIFY_SITE:-}"
+  scope="${CFG_VERCEL_SCOPE:-}"
+
+  if [[ ! -s "$STATE_FILE" ]]; then
+    echo '{"server":{},"relays":[]}' > "$STATE_FILE"
+  fi
+
+  jq \
+    --arg domain "$CFG_DOMAIN" \
+    --arg port "$CFG_INBOUND_PORT" \
+    --arg relay_path "$CFG_RELAY_PATH" \
+    --arg uuid "${INBOUND_UUID:-}" \
+    --arg ssl_cert "${SSL_CERT:-}" \
+    --arg ssl_key "${SSL_KEY:-}" \
+    --arg platform "${CFG_PLATFORM:-}" \
+    --arg url "$relay_url" \
+    --arg public_path "${CFG_PUBLIC_PATH:-}" \
+    --arg project "$project" \
+    --arg site "$site" \
+    --arg scope "$scope" \
+    --arg e2e "${E2E_STATUS:-UNKNOWN}" \
+    --arg ping_avg "${E2E_PING_AVG:-}" \
+    --arg client_link "$client_link" \
+    --arg updated_at "$now" \
+    '
+    .server = {
+      domain: $domain,
+      inbound_port: $port,
+      relay_path: $relay_path,
+      uuid: $uuid,
+      ssl_cert: $ssl_cert,
+      ssl_key: $ssl_key,
+      updated_at: $updated_at
+    }
+    | .relays = (
+      (.relays // [])
+      | map(select(.url != $url or .public_path != $public_path))
+      + [{
+          platform: $platform,
+          url: $url,
+          public_path: $public_path,
+          project: $project,
+          site: $site,
+          scope: $scope,
+          e2e_status: $e2e,
+          ping_avg_ms: $ping_avg,
+          client_link: $client_link,
+          updated_at: $updated_at
+        }]
+    )
+    ' "$STATE_FILE" > "$tmp_state" && mv "$tmp_state" "$STATE_FILE"
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
+  jq -r '(.relays // [])[] | .client_link // empty' "$STATE_FILE" > "$LINKS_FILE" 2>/dev/null || true
+  chmod 600 "$LINKS_FILE" 2>/dev/null || true
+  ok "Install state saved: $STATE_FILE"
+  [[ -s "$LINKS_FILE" ]] && ok "Client links saved: $LINKS_FILE"
+}
+
 # =============================================================
 #  PHASE 2 — DOWNLOAD & INSTALL ALL TOOLS (no config yet)
 # =============================================================
@@ -474,17 +656,28 @@ phase3_collect_input() {
   echo -e "  ${C_GRAY}Fill in the values below. Press Enter to accept defaults.${C_RESET}\n"
 
   # ── SSL / Domain ────────────────────────────────────────
-  echo -e "\n  ${C_CYAN}[ SSL & Domain ]${C_RESET}"
-  CFG_DOMAIN=$(read_required "Your domain (e.g. sub.example.com)")
-  CFG_EMAIL=$(read_default   "Email for acme.sh notifications" "admin@${CFG_DOMAIN}")
+  if [[ "${ADD_RELAY_ONLY:-false}" == "true" ]]; then
+    echo -e "\n  ${C_CYAN}[ Reusing Existing Server Config ]${C_RESET}"
+    echo -e "  ${C_WHITE}Domain       :${C_RESET} $CFG_DOMAIN"
+    echo -e "  ${C_WHITE}Inbound port :${C_RESET} $CFG_INBOUND_PORT"
+    echo -e "  ${C_WHITE}RELAY_PATH   :${C_RESET} $CFG_RELAY_PATH"
+    echo -e "  ${C_WHITE}UUID         :${C_RESET} $INBOUND_UUID"
+    CFG_EMAIL="admin@${CFG_DOMAIN}"
+    CFG_PUBLIC_PATH=$(read_default "PUBLIC_RELAY_PATH (Vercel/Netlify-side path)" "/api")
+    [[ "${CFG_PUBLIC_PATH:0:1}" != "/" ]] && CFG_PUBLIC_PATH="/$CFG_PUBLIC_PATH"
+  else
+    echo -e "\n  ${C_CYAN}[ SSL & Domain ]${C_RESET}"
+    CFG_DOMAIN=$(read_required "Your domain (e.g. sub.example.com)")
+    CFG_EMAIL=$(read_default   "Email for acme.sh notifications" "admin@${CFG_DOMAIN}")
 
-  # ── Inbound / Relay ─────────────────────────────────────
-  echo -e "\n  ${C_CYAN}[ Inbound & Relay ]${C_RESET}"
-  CFG_INBOUND_PORT=$(read_default "Inbound port on server (XHTTP)" "443")
-  CFG_RELAY_PATH=$(read_default   "RELAY_PATH  (inbound path, e.g. /api)" "/api")
-  CFG_PUBLIC_PATH=$(read_default  "PUBLIC_RELAY_PATH (Vercel-side path)" "/api")
-  [[ "${CFG_RELAY_PATH:0:1}" != "/" ]] && CFG_RELAY_PATH="/$CFG_RELAY_PATH"
-  [[ "${CFG_PUBLIC_PATH:0:1}" != "/" ]] && CFG_PUBLIC_PATH="/$CFG_PUBLIC_PATH"
+    # ── Inbound / Relay ─────────────────────────────────────
+    echo -e "\n  ${C_CYAN}[ Inbound & Relay ]${C_RESET}"
+    CFG_INBOUND_PORT=$(read_default "Inbound port on server (XHTTP)" "443")
+    CFG_RELAY_PATH=$(read_default   "RELAY_PATH  (inbound path, e.g. /api)" "/api")
+    CFG_PUBLIC_PATH=$(read_default  "PUBLIC_RELAY_PATH (Vercel-side path)" "/api")
+    [[ "${CFG_RELAY_PATH:0:1}" != "/" ]] && CFG_RELAY_PATH="/$CFG_RELAY_PATH"
+    [[ "${CFG_PUBLIC_PATH:0:1}" != "/" ]] && CFG_PUBLIC_PATH="/$CFG_PUBLIC_PATH"
+  fi
 
   # ── Platform credentials ─────────────────────────────────
   local rand_proj
@@ -1733,6 +1926,8 @@ phase6_summary() {
   # alpn=h2,http/1.1 for compatibility; xPaddingBytes adds traffic obfuscation
   local CLIENT_LINK="vless://${INBOUND_UUID:-UUID}@${VERCEL_HOST}:443?encryption=none&security=tls&sni=${VERCEL_HOST}&fp=chrome&alpn=h2%2Chttp%2F1.1&insecure=0&allowInsecure=0&type=xhttp&host=${VERCEL_HOST}&path=${ENCODED_PATH}&mode=auto&extra=%7B%22xPaddingBytes%22%3A%22100-1000%22%7D#${LINK_TAG}"
 
+  _persist_current_relay "$CLIENT_LINK"
+
   echo ""
   echo -e "${C_GREEN}"
   echo "  ╔══════════════════════════════════════════════════════════╗"
@@ -1873,29 +2068,20 @@ main() {
   echo -e "  ${C_GRAY}Tip: Press Ctrl+C at any time to abort.${C_RESET}"
   echo ""
 
-  echo -e "  ${C_CYAN}[ Deployment Platform ]${C_RESET}"
-  echo -e "  ${C_WHITE}Choose relay platform:${C_RESET}"
-  echo -e "    ${C_YELLOW}1${C_RESET}) Vercel"
-  echo -e "    ${C_YELLOW}2${C_RESET}) Netlify"
-  while true; do
-    read -rp "$(echo -e "  ${C_WHITE}Enter choice [1/2]${C_RESET}: ")" plat_choice
-    case "$plat_choice" in
-      1) CFG_PLATFORM="vercel";  break ;;
-      2) CFG_PLATFORM="netlify"; break ;;
-      *) fail "Enter 1 for Vercel or 2 for Netlify" ;;
-    esac
-  done
-  ok "Platform: ${CFG_PLATFORM}"
-  echo ""
-
   read -rp "$(echo -e "  ${C_WHITE}Press Enter to start installation...${C_RESET}")"
 
   phase1_preflight
   phase2_install_all
+  phase_existing_install_mode
+  phase_select_platform
   phase3_collect_input
   autofix_diagnose "FIREWALL"
-  autofix_and_retry "SSL"    phase4a_ssl
-  autofix_and_retry "XRAYSSL" phase4b_configure_xray
+  if [[ "${ADD_RELAY_ONLY:-false}" == "true" ]]; then
+    ok "Skipping SSL issuance and Xray reconfiguration for add-relay mode"
+  else
+    autofix_and_retry "SSL"    phase4a_ssl
+    autofix_and_retry "XRAYSSL" phase4b_configure_xray
+  fi
   autofix_and_retry "${CFG_PLATFORM:-vercel}" phase4c_deploy
   phase5_healthcheck
   phase6_summary
