@@ -5,16 +5,16 @@
 #  Repository: https://github.com/avacocloud/XHTTP-Installer
 #  Licensed under GPL-3.0. See LICENSE file.
 # =============================================================
-# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/avacocloud/XHTTP-Installer/main/install.sh)
+# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/easyfast2008/XHTTP-Installer/codex/multi-relay-test/install.sh)
 
 set -euo pipefail
 
 readonly AVC_BUILD_ID="avc-7f3a92e1-2025-avacocloud"
 export AVC_BUILD_ID
 
-REPO_URL="https://github.com/avacocloud/XHTTP-Installer.git"
+REPO_URL="https://github.com/easyfast2008/XHTTP-Installer.git"
 TARGET_DIR="/root/XHTTP-Installer"
-BRANCH="main"
+BRANCH="codex/multi-relay-test"
 
 C_CYAN="\033[1;36m"; C_GREEN="\033[1;32m"; C_YELLOW="\033[1;33m"
 C_RED="\033[1;31m"; C_RESET="\033[0m"
@@ -40,7 +40,9 @@ fi
 # ── clone or update repo ─────────────────────────────────
 if [[ -d "$TARGET_DIR/.git" ]]; then
   warn "Existing install found at $TARGET_DIR — updating..."
+  git -C "$TARGET_DIR" remote set-url origin "$REPO_URL"
   git -C "$TARGET_DIR" fetch --depth=1 origin "$BRANCH"
+  git -C "$TARGET_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
   git -C "$TARGET_DIR" reset --hard "origin/$BRANCH"
   ok "Repo updated"
 else

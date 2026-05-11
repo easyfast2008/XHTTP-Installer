@@ -33,7 +33,7 @@
 </div>
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/avacocloud/XHTTP-Installer/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/easyfast2008/XHTTP-Installer/codex/multi-relay-test/install.sh)
 ```
 
 <div align="center">
@@ -298,7 +298,7 @@ https://app.netlify.com/user/applications#personal-access-tokens
 SSH into your server and run:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/avacocloud/XHTTP-Installer/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/easyfast2008/XHTTP-Installer/codex/multi-relay-test/install.sh)
 ```
 
 > [!TIP]
@@ -311,7 +311,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/avacocloud/XHTTP-Installer/m
 
 **Manual git clone:**
 ```bash
-git clone https://github.com/avacocloud/XHTTP-Installer.git /root/XHTTP-Installer
+git clone --branch codex/multi-relay-test https://github.com/easyfast2008/XHTTP-Installer.git /root/XHTTP-Installer
 cd /root/XHTTP-Installer
 sudo bash Deploy-Ubuntu.sh
 ```
