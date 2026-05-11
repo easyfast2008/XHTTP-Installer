@@ -236,6 +236,67 @@ phase1_preflight() {
   fi
 }
 
+_find_acme_cmd() {
+  local candidates=()
+  candidates+=("${ACME_CMD:-}")
+  candidates+=("${HOME:-/root}/.acme.sh/acme.sh")
+  candidates+=("/root/.acme.sh/acme.sh")
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    candidates+=("/home/${SUDO_USER}/.acme.sh/acme.sh")
+  fi
+
+  local cmd
+  for cmd in "${candidates[@]}"; do
+    [[ -n "$cmd" && -f "$cmd" ]] || continue
+    chmod +x "$cmd" 2>/dev/null || true
+    echo "$cmd"
+    return 0
+  done
+
+  if command -v acme.sh &>/dev/null; then
+    command -v acme.sh
+    return 0
+  fi
+
+  return 1
+}
+
+_ensure_acme_ready() {
+  local cmd
+  if cmd=$(_find_acme_cmd); then
+    ACME_CMD="$cmd"
+  else
+    local acme_parent="/root"
+    local install_out install_rc=0
+    info "Installing acme.sh..."
+    install_out=$(curl -fsSL https://get.acme.sh | HOME="$acme_parent" sh -s -- --install-online 2>&1) || install_rc=$?
+    echo "$install_out" | grep -E "(install|OK|error|Error)" || true
+    if [[ $install_rc -ne 0 ]]; then
+      fail "acme.sh installer failed (exit $install_rc)"
+      return 1
+    fi
+    sleep 1
+    if ! cmd=$(_find_acme_cmd); then
+      fail "acme.sh installed but executable was not found under /root/.acme.sh"
+      return 1
+    fi
+    ACME_CMD="$cmd"
+    ok "acme.sh installed: $ACME_CMD"
+  fi
+
+  if [[ ! -x "$ACME_CMD" ]]; then
+    chmod +x "$ACME_CMD" 2>/dev/null || true
+  fi
+  if [[ ! -f "$ACME_CMD" && ! -x "$ACME_CMD" ]]; then
+    fail "acme.sh executable is not usable: $ACME_CMD"
+    return 1
+  fi
+
+  "$ACME_CMD" --set-default-ca --server letsencrypt >/dev/null 2>&1 || \
+    warn "Could not set default ACME CA to Let's Encrypt; issuing commands will still pass --server letsencrypt"
+  return 0
+}
+
 # =============================================================
 #  PHASE 2 — DOWNLOAD & INSTALL ALL TOOLS (no config yet)
 # =============================================================
@@ -270,15 +331,8 @@ phase2_install_all() {
   fi
 
   # ── 2c. acme.sh ─────────────────────────────────────────
-  if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
-    ok "acme.sh already installed"
-  else
-    info "Installing acme.sh..."
-    curl -fsSL https://get.acme.sh | sh -s -- --install-online 2>&1 | \
-      grep -E "(install|OK|error|Error)" || true
-    ok "acme.sh installed"
-  fi
-  ACME_CMD="$HOME/.acme.sh/acme.sh"
+  _ensure_acme_ready
+  ok "acme.sh ready: $ACME_CMD"
 
   # ── 2d. Vercel CLI ──────────────────────────────────────
   if command -v vercel &>/dev/null; then
@@ -440,6 +494,42 @@ phase3_collect_input() {
 # =============================================================
 #  PHASE 4a — SSL WITH acme.sh
 # =============================================================
+_ssl_target_cert_usable() {
+  [[ -s "${SSL_CERT:-}" && -s "${SSL_KEY:-}" ]] || return 1
+  openssl x509 -in "$SSL_CERT" -noout -checkend 604800 >/dev/null 2>&1 || return 1
+  return 0
+}
+
+_acme_source_cert_complete() {
+  [[ -n "${ACME_CMD:-}" ]] || return 1
+  local acme_home
+  acme_home="$(cd "$(dirname "$ACME_CMD")" 2>/dev/null && pwd)" || return 1
+
+  local dir
+  for dir in "${acme_home}/${CFG_DOMAIN}_ecc" "${acme_home}/${CFG_DOMAIN}"; do
+    [[ -d "$dir" ]] || continue
+    if [[ -s "${dir}/${CFG_DOMAIN}.cer" && -s "${dir}/${CFG_DOMAIN}.key" ]] || \
+       [[ -s "${dir}/fullchain.cer" && -s "${dir}/${CFG_DOMAIN}.key" ]]; then
+      [[ "$dir" == *_ecc ]] && ACME_CERT_IS_ECC=1 || ACME_CERT_IS_ECC=0
+      return 0
+    fi
+  done
+  return 1
+}
+
+_install_acme_cert() {
+  local install_out install_rc=0
+  local ecc_args=()
+  [[ "${ACME_CERT_IS_ECC:-1}" == "1" ]] && ecc_args=(--ecc)
+  install_out=$("$ACME_CMD" --install-cert -d "$CFG_DOMAIN" "${ecc_args[@]}" \
+    --cert-file     "${SSL_DIR}/cert.pem" \
+    --key-file      "${SSL_KEY}" \
+    --fullchain-file "${SSL_CERT}" \
+    --reloadcmd     "systemctl restart xray 2>/dev/null || true" 2>&1) || install_rc=$?
+  echo "$install_out" | tail -8
+  return "$install_rc"
+}
+
 phase4a_ssl() {
   step "PHASE 4a — Obtaining SSL certificate for ${CFG_DOMAIN}"
 
@@ -449,6 +539,35 @@ phase4a_ssl() {
   SSL_CERT="${SSL_DIR}/fullchain.pem"
   SSL_KEY="${SSL_DIR}/privkey.pem"
 
+  if ! _ensure_acme_ready; then
+    autofix_diagnose "SSL"
+    return 1
+  fi
+
+  if _ssl_target_cert_usable; then
+    chmod 644 "$SSL_CERT" 2>/dev/null || true
+    chmod 640 "$SSL_KEY"  2>/dev/null || true
+    chgrp nobody "$SSL_KEY" 2>/dev/null || true
+    chmod o+x /etc/ssl/xhttp 2>/dev/null || true
+    chmod o+x "$(dirname "$SSL_KEY")" 2>/dev/null || true
+    ok "Reusable SSL certificate found: $SSL_CERT"
+    return 0
+  fi
+
+  if _acme_source_cert_complete; then
+    info "Existing acme.sh certificate found — installing to $SSL_DIR"
+    if _install_acme_cert && _ssl_target_cert_usable; then
+      chmod 644 "$SSL_CERT" 2>/dev/null || true
+      chmod 640 "$SSL_KEY"  2>/dev/null || true
+      chgrp nobody "$SSL_KEY" 2>/dev/null || true
+      chmod o+x /etc/ssl/xhttp 2>/dev/null || true
+      chmod o+x "$(dirname "$SSL_KEY")" 2>/dev/null || true
+      ok "SSL certificate installed → $SSL_CERT"
+      return 0
+    fi
+    warn "Existing acme.sh state is incomplete or invalid — issuing a fresh certificate"
+  fi
+
   # Stop any service using port 80 temporarily
   local port80_used=false
   if ss -tlnp 2>/dev/null | grep -q ':80 '; then
@@ -457,34 +576,60 @@ phase4a_ssl() {
   fi
 
   # Register acme.sh account
-  "$ACME_CMD" --register-account -m "$CFG_EMAIL" 2>&1 | grep -v "^$" || true
+  local register_out register_rc=0
+  register_out=$("$ACME_CMD" --register-account --server letsencrypt -m "$CFG_EMAIL" 2>&1) || register_rc=$?
+  echo "$register_out" | grep -v "^$" || true
+  [[ $register_rc -ne 0 ]] && warn "Account registration returned exit $register_rc; continuing with issuance"
 
   # Issue certificate
+  local issue_out issue_rc=0
   if [[ "$port80_used" == "true" ]]; then
     # Try nginx/apache webroot if available
     if command -v nginx &>/dev/null; then
-      "$ACME_CMD" --issue -d "$CFG_DOMAIN" --webroot /var/www/html \
-        --keylength ec-256 2>&1 | tail -5
+      mkdir -p /var/www/html
+      issue_out=$("$ACME_CMD" --issue -d "$CFG_DOMAIN" --webroot /var/www/html \
+        --server letsencrypt --keylength ec-256 2>&1) || issue_rc=$?
     else
       warn "Cannot free port 80 automatically. Stopping xray temporarily..."
       systemctl stop xray 2>/dev/null || true
-      "$ACME_CMD" --issue -d "$CFG_DOMAIN" --standalone \
-        --keylength ec-256 2>&1 | tail -5
+      issue_out=$("$ACME_CMD" --issue -d "$CFG_DOMAIN" --standalone \
+        --server letsencrypt --keylength ec-256 2>&1) || issue_rc=$?
       systemctl start xray 2>/dev/null || true
     fi
   else
-    "$ACME_CMD" --issue -d "$CFG_DOMAIN" --standalone \
-      --keylength ec-256 2>&1 | tail -5
+    issue_out=$("$ACME_CMD" --issue -d "$CFG_DOMAIN" --standalone \
+      --server letsencrypt --keylength ec-256 2>&1) || issue_rc=$?
   fi
+  echo "$issue_out" | tail -12
+
+  if [[ $issue_rc -ne 0 ]]; then
+    if _ssl_target_cert_usable; then
+      chmod 644 "$SSL_CERT" 2>/dev/null || true
+      chmod 640 "$SSL_KEY"  2>/dev/null || true
+      chgrp nobody "$SSL_KEY" 2>/dev/null || true
+      chmod o+x /etc/ssl/xhttp 2>/dev/null || true
+      chmod o+x "$(dirname "$SSL_KEY")" 2>/dev/null || true
+      warn "Issuance failed, but a valid installed certificate is already present"
+      return 0
+    fi
+    if echo "$issue_out" | grep -qiE "rejectedIdentifier|disallowed|invalid.*domain"; then
+      fail "ACME rejected the domain identifier. Verify the domain is allowed by the CA and retry with a valid hostname."
+    else
+      fail "acme.sh issue failed (exit $issue_rc)."
+    fi
+    autofix_diagnose "SSL"
+    return 1
+  fi
+  ACME_CERT_IS_ECC=1
 
   # Install certificate to target dir
-  "$ACME_CMD" --installcert -d "$CFG_DOMAIN" \
-    --cert-file     "${SSL_DIR}/cert.pem" \
-    --key-file      "${SSL_KEY}" \
-    --fullchain-file "${SSL_CERT}" \
-    --reloadcmd     "systemctl restart xray 2>/dev/null || true" 2>&1 | tail -5
+  if ! _install_acme_cert; then
+    fail "acme.sh issued the certificate, but installing it to $SSL_DIR failed."
+    autofix_diagnose "SSL"
+    return 1
+  fi
 
-  if [[ -f "$SSL_CERT" && -f "$SSL_KEY" ]]; then
+  if _ssl_target_cert_usable; then
     chmod 644 "$SSL_CERT" 2>/dev/null || true
     chmod 640 "$SSL_KEY"  2>/dev/null || true
     chgrp nobody "$SSL_KEY" 2>/dev/null || true
