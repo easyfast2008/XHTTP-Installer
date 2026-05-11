@@ -33,7 +33,7 @@
 </div>
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/avacocloud/XHTTP-Installer/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/easyfast2008/XHTTP-Installer/codex/fix-acme-vercel-handling/install.sh)
 ```
 
 <div align="center">
@@ -315,7 +315,7 @@ https://app.netlify.com/user/applications#personal-access-tokens
 SSH بزن به سرور و این یه خط رو اجرا کن:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/avacocloud/XHTTP-Installer/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/easyfast2008/XHTTP-Installer/codex/fix-acme-vercel-handling/install.sh)
 ```
 
 > [!TIP]
@@ -328,7 +328,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/avacocloud/XHTTP-Installer/m
 
 **با git (دستی):**
 ```bash
-git clone https://github.com/avacocloud/XHTTP-Installer.git /root/XHTTP-Installer
+git clone --branch codex/fix-acme-vercel-handling https://github.com/easyfast2008/XHTTP-Installer.git /root/XHTTP-Installer
 cd /root/XHTTP-Installer
 sudo bash Deploy-Ubuntu.sh
 ```
