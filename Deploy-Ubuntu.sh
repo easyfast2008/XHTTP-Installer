@@ -92,8 +92,7 @@ read_required() {
 read_secret() {
   local prompt="$1" val
   while true; do
-    read -rsp "$(echo -e "  ${C_WHITE}${prompt}${C_RESET} ${C_GRAY}(input hidden; paste then press Enter)${C_RESET}: ")" val
-    echo ""
+    read -rp "$(echo -e "  ${C_WHITE}${prompt}${C_RESET}: ")" val
     if [[ -n "${val// }" ]]; then echo "$val"; return; fi
     fail "Required field."
   done
@@ -454,7 +453,6 @@ _read_vercel_token() {
     token=$(read_secret "$prompt")
     token=$(_clean_secret_value "$token")
     if [[ -n "$token" ]]; then
-      info "Token captured: $(_token_hint "$token")"
       echo "$token"
       return 0
     fi
@@ -742,6 +740,7 @@ phase3_collect_input() {
       CFG_VERCEL_TOKEN=$(_read_vercel_token "Vercel API token (Settings → Tokens)")
       [[ -z "${CFG_VERCEL_TOKEN// }" ]] && fail "Required field."
     done
+    info "Token captured: $(_token_hint "$CFG_VERCEL_TOKEN")"
     CFG_PROJECT_NAME=$(read_default "Vercel project name" "$rand_proj")
     CFG_VERCEL_SCOPE=$(read_default "Vercel scope/team slug (leave blank for personal)" "")
     CFG_NETLIFY_TOKEN=""
@@ -1231,6 +1230,7 @@ phase4c_vercel_deploy() {
       info "Token received: $(_token_hint "$CFG_VERCEL_TOKEN")"
       warn "Get a token from: https://vercel.com/account/tokens"
       CFG_VERCEL_TOKEN=$(_read_vercel_token "Paste new Vercel token")
+      info "Token captured: $(_token_hint "$CFG_VERCEL_TOKEN")"
       export VERCEL_TOKEN="${CFG_VERCEL_TOKEN}"
     else
       ok "Vercel auth OK: $whoami_out"
