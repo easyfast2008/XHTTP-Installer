@@ -92,7 +92,8 @@ read_required() {
 read_secret() {
   local prompt="$1" val
   while true; do
-    read -rp "$(echo -e "  ${C_WHITE}${prompt}${C_RESET}: ")" val
+    read -rsp "$(echo -e "  ${C_WHITE}${prompt}${C_RESET}: ")" val
+    echo ""
     if [[ -n "${val// }" ]]; then echo "$val"; return; fi
     fail "Required field."
   done
@@ -432,6 +433,57 @@ phase_select_platform() {
   ok "Platform: ${CFG_PLATFORM}"
 }
 
+_clean_secret_value() {
+  printf "%s" "${1:-}" | tr -d '[:space:]'
+}
+
+_token_hint() {
+  local token="$(_clean_secret_value "${1:-}")"
+  local len=${#token}
+  if [[ $len -le 10 ]]; then
+    echo "len=${len}"
+  else
+    echo "len=${len}, prefix=${token:0:4}, suffix=${token: -4}"
+  fi
+}
+
+_read_vercel_token() {
+  local prompt="$1"
+  local token
+  while true; do
+    token=$(read_secret "$prompt")
+    token=$(_clean_secret_value "$token")
+    if [[ -n "$token" ]]; then
+      echo "$token"
+      return 0
+    fi
+    fail "Required field."
+  done
+}
+
+_validate_vercel_token() {
+  local token="$(_clean_secret_value "${1:-}")"
+  local out user_json username
+
+  out=$(vercel whoami --token "$token" 2>&1 || true)
+  if ! echo "$out" | grep -qiE "error|invalid|unauthorized|forbidden|not authorized"; then
+    echo "$out"
+    return 0
+  fi
+
+  user_json=$(curl -fsS --max-time 10 \
+    -H "Authorization: Bearer ${token}" \
+    https://api.vercel.com/v2/user 2>/dev/null || true)
+  username=$(echo "$user_json" | jq -r '.user.username // empty' 2>/dev/null || true)
+  if [[ -n "$username" ]]; then
+    echo "API auth OK: $username"
+    return 0
+  fi
+
+  echo "$out"
+  return 1
+}
+
 _persist_current_relay() {
   local client_link="${1:-}"
   local relay_url="${VERCEL_URL:-}"
@@ -686,7 +738,7 @@ phase3_collect_input() {
     echo -e "\n  ${C_CYAN}[ Vercel Deployment ]${C_RESET}"
     CFG_VERCEL_TOKEN=""
     while [[ -z "${CFG_VERCEL_TOKEN// }" ]]; do
-      read -rp "$(echo -e "  ${C_WHITE}Vercel API token (Settings → Tokens)${C_RESET}: ")" CFG_VERCEL_TOKEN
+      CFG_VERCEL_TOKEN=$(_read_vercel_token "Vercel API token (Settings → Tokens)")
       [[ -z "${CFG_VERCEL_TOKEN// }" ]] && fail "Required field."
     done
     CFG_PROJECT_NAME=$(read_default "Vercel project name" "$rand_proj")
@@ -1165,17 +1217,19 @@ phase4c_vercel_deploy() {
   fi
   pushd "$VERCEL_DIR" > /dev/null
 
+  CFG_VERCEL_TOKEN=$(_clean_secret_value "$CFG_VERCEL_TOKEN")
   export VERCEL_TOKEN="${CFG_VERCEL_TOKEN}"
 
   # ── Validate token (re-prompt if invalid) ───────────────
   local whoami_out attempt=0
   while [[ $attempt -lt 3 ]]; do
     attempt=$(( attempt + 1 ))
-    whoami_out=$(vercel whoami --token "$CFG_VERCEL_TOKEN" 2>&1 || true)
-    if echo "$whoami_out" | grep -qiE "error|invalid|unauthorized|forbidden"; then
+    whoami_out=$(_validate_vercel_token "$CFG_VERCEL_TOKEN" 2>&1 || true)
+    if echo "$whoami_out" | grep -qiE "error|invalid|unauthorized|forbidden|not authorized"; then
       fail "Vercel token invalid (attempt $attempt/3): $whoami_out"
+      info "Token received: $(_token_hint "$CFG_VERCEL_TOKEN")"
       warn "Get a token from: https://vercel.com/account/tokens"
-      CFG_VERCEL_TOKEN=$(read_secret "Paste new Vercel token")
+      CFG_VERCEL_TOKEN=$(_read_vercel_token "Paste new Vercel token")
       export VERCEL_TOKEN="${CFG_VERCEL_TOKEN}"
     else
       ok "Vercel auth OK: $whoami_out"
