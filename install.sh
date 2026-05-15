@@ -42,8 +42,8 @@ if [[ -d "$TARGET_DIR/.git" ]]; then
   warn "Existing install found at $TARGET_DIR — updating..."
   git -C "$TARGET_DIR" remote set-url origin "$REPO_URL"
   git -C "$TARGET_DIR" fetch --depth=1 origin "$BRANCH"
-  git -C "$TARGET_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
-  git -C "$TARGET_DIR" reset --hard "origin/$BRANCH"
+  git -C "$TARGET_DIR" checkout -B "$BRANCH" FETCH_HEAD
+  git -C "$TARGET_DIR" reset --hard FETCH_HEAD
   ok "Repo updated"
 else
   if [[ -d "$TARGET_DIR" ]]; then
