@@ -92,7 +92,7 @@ read_required() {
 read_secret() {
   local prompt="$1" val
   while true; do
-    read -rsp "$(echo -e "  ${C_WHITE}${prompt}${C_RESET}: ")" val
+    read -rsp "$(echo -e "  ${C_WHITE}${prompt}${C_RESET} ${C_GRAY}(input hidden; paste then press Enter)${C_RESET}: ")" val
     echo ""
     if [[ -n "${val// }" ]]; then echo "$val"; return; fi
     fail "Required field."
@@ -454,6 +454,7 @@ _read_vercel_token() {
     token=$(read_secret "$prompt")
     token=$(_clean_secret_value "$token")
     if [[ -n "$token" ]]; then
+      info "Token captured: $(_token_hint "$token")"
       echo "$token"
       return 0
     fi
